@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mcp_server": {
+      "command": "python3",
+      "args": [
+        "/home/na0/mcp_server/src/mcp/server/mcp_server.py"
+      ],
+      "env": {},
+      "description": "ROS2 Robot control via MCP"
+    }
+  }
+}
