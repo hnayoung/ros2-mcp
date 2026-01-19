@@ -54,9 +54,14 @@ class MCPClient:
 
     def start_server(self):
         """MCP 서버 시작"""
-        print("MCP 서버 시작 중...")
+        robot_type = os.getenv("ROBOT_TYPE", "turtlesim")
+        print(f"MCP 서버 시작 중... (ROBOT_TYPE={robot_type})")
         # 프로젝트 루트 디렉토리 계산 (client -> mcp -> src -> project_root)
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+        # 환경 변수를 서브프로세스에 전달
+        env = os.environ.copy()
+        env["ROS_LOG_DIR"] = "/tmp"
 
         self.server_process = subprocess.Popen(
             ['python3', '-m', 'ros_mcp.server'],
@@ -65,7 +70,8 @@ class MCPClient:
             stderr=subprocess.PIPE,  # stderr도 캡처하여 디버깅 가능
             text=True,
             bufsize=1,
-            cwd=project_root  # src 디렉토리에서 실행
+            cwd=project_root,  # src 디렉토리에서 실행
+            env=env  # 환경 변수 전달
         )
 
         # 서버 시작 대기

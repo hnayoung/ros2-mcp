@@ -1,8 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(echo:*)",
-      "Bash(pip3 show:*)"
+      "Bash(ros2 topic list:*)",
+      "Bash(chmod:*)",
+      "Bash(source:*)",
+      "Bash(python scripts/test_g1_ros1.py:*)",
+      "Bash(ros2 service list:*)",
+      "Bash(ros2 action list:*)"
     ]
   }
 }
