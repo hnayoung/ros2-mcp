@@ -1,3 +1,7 @@
+import os
+# CycloneDDS 설정 (프로세스 간 통신 개선)
+os.environ['CYCLONEDDS_URI'] = 'file:///tmp/cyclonedds.xml'
+
 import math
 import time
 import numpy as np
@@ -82,7 +86,7 @@ class G1Adapter(BaseRobotAdapter):
         self.max_linear_speed = 1.5
         self.max_angular_speed = 1.0
         self.rate_hz = 50
-        self.dt = 0.002
+        self.dt = 0.02  # 50Hz - mujoco 시뮬레이터와 호환
 
         # 상태 변수
         self.is_standing = False
@@ -110,7 +114,7 @@ class G1Adapter(BaseRobotAdapter):
     def _init_dds(self):
         """DDS 채널 초기화"""
         try:
-            ChannelFactoryInitialize(1, "lo")
+            ChannelFactoryInitialize(1, "eth0")
 
             self.low_cmd_pub = ChannelPublisher("rt/lowcmd", LowCmd_)
             self.low_cmd_pub.Init()
@@ -331,16 +335,37 @@ class G1Adapter(BaseRobotAdapter):
             self.position_y = msg.position[1]
             self.position_z = msg.position[2]
 
+    def _wait_for_low_state(self, timeout=5.0):
+        """LowState 수신 대기"""
+        start = time.time()
+        while self.low_state is None and (time.time() - start) < timeout:
+            time.sleep(0.1)
+        return self.low_state is not None
+
+    def _get_current_positions(self):
+        """현재 관절 위치 가져오기 (LowState에서)"""
+        if self.low_state:
+            positions = np.zeros(self.NUM_MOTORS)
+            for i in range(self.NUM_MOTORS):
+                positions[i] = self.low_state.motor_state[i].q
+            return positions
+        return self.current_pose.copy()
+
     def _send_motor_cmd(self, target_positions, kp=50.0, kd=3.5, duration=1.0):
         """모터 명령 전송"""
         if not self.dds_initialized:
             return False
 
+        # LowState 수신 대기
+        if not self._wait_for_low_state(timeout=3.0):
+            print("[G1Adapter] Warning: LowState not received, using stored pose")
+
         cmd = unitree_hg_msg_dds__LowCmd_()
         cmd.mode_pr = 0
         cmd.mode_machine = 0
 
-        start_pose = self.current_pose.copy()
+        # 실제 현재 위치에서 시작 (LowState 기반)
+        start_pose = self._get_current_positions()
         start_time = time.time()
         num_motors = min(self.NUM_MOTORS, len(target_positions))
 
@@ -349,11 +374,24 @@ class G1Adapter(BaseRobotAdapter):
             phase = min(elapsed / duration, 1.0)
             smooth = np.tanh(phase * 2) / np.tanh(2)
 
+            # kp를 점진적으로 증가 (처음 0.5초 동안)
+            kp_ratio = min(elapsed / 0.5, 1.0)
+            current_kp = kp * kp_ratio
+
             for i in range(num_motors):
-                pos = (1 - smooth) * start_pose[i] + smooth * target_positions[i]
+                # 현재 위치 업데이트 (LowState에서)
+                if self.low_state:
+                    current_q = self.low_state.motor_state[i].q
+                else:
+                    current_q = start_pose[i]
+
+                # 목표 위치 보간
+                target_q = float(target_positions[i])
+                pos = (1 - smooth) * start_pose[i] + smooth * target_q
+
                 cmd.motor_cmd[i].mode = 0x01
                 cmd.motor_cmd[i].q = float(pos)
-                cmd.motor_cmd[i].kp = float(kp)
+                cmd.motor_cmd[i].kp = float(current_kp)
                 cmd.motor_cmd[i].dq = 0.0
                 cmd.motor_cmd[i].kd = float(kd)
                 cmd.motor_cmd[i].tau = 0.0
@@ -362,7 +400,7 @@ class G1Adapter(BaseRobotAdapter):
             self.low_cmd_pub.Write(cmd)
             time.sleep(self.dt)
 
-        self.current_pose = target_positions.copy()
+        self.current_pose = np.array(target_positions, dtype=float)
         return True
 
     # ============== BaseRobotAdapter 오버라이드 ==============

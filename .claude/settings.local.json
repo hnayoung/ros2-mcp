@@ -6,7 +6,10 @@
       "Bash(source:*)",
       "Bash(python scripts/test_g1_ros1.py:*)",
       "Bash(ros2 service list:*)",
-      "Bash(ros2 action list:*)"
+      "Bash(ros2 action list:*)",
+      "Bash(find:*)",
+      "Bash(pkill:*)",
+      "Bash(ip addr:*)"
     ]
   }
 }
