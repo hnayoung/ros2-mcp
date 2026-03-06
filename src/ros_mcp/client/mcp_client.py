@@ -15,7 +15,7 @@ load_dotenv()
 # OpenRouter API 설정
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "openai/gpt-oss-20b"  
+MODEL = "openai/gpt-oss-20b"  # 사용할 모델 이름
 MAX_TOKENS = 1024
 TEMPERATURE = 0.7
 MAX_AGENT_ITERATIONS = 10 # 최대 에이전트 반복 횟수
@@ -54,8 +54,7 @@ class MCPClient:
 
     def start_server(self):
         """MCP 서버 시작"""
-        robot_type = os.getenv("ROBOT_TYPE", "turtlesim")
-        print(f"MCP 서버 시작 중... (ROBOT_TYPE={robot_type})")
+        print("MCP 서버 시작 중...")
         # 프로젝트 루트 디렉토리 계산 (client -> mcp -> src -> project_root)
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
