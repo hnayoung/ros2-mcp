@@ -3,6 +3,7 @@ import json
 import os
 import select
 import subprocess
+import sys
 from typing import List, Dict, Optional
 import requests
 import traceback
@@ -40,17 +41,20 @@ class MCPClient:
 
         self.server_process.stdin.write(json.dumps(message) + '\n')
         self.server_process.stdin.flush()
-        response = self.server_process.stdout.readline()
+        while True:
+            response = self.server_process.stdout.readline()
 
-        if not response.strip():
-            # 빈 응답인 경우 stderr 확인
-            stderr_output = ""
-            if self.server_process.stderr:
-                if select.select([self.server_process.stderr], [], [], 0.1)[0]:
-                    stderr_output = self.server_process.stderr.read(4096)
-            raise RuntimeError(f"서버로부터 빈 응답을 받았습니다. stderr: {stderr_output}")
+            if not response.strip():
+                stderr_output = ""
+                if self.server_process.stderr:
+                    if select.select([self.server_process.stderr], [], [], 0.1)[0]:
+                        stderr_output = self.server_process.stderr.read(4096)
+                raise RuntimeError(f"서버로부터 빈 응답을 받았습니다. stderr: {stderr_output}")
 
-        return json.loads(response)
+            try:
+                return json.loads(response)
+            except json.JSONDecodeError:
+                print(f"[SERVER-STDOUT] {response.strip()}", file=sys.stderr)
 
     def start_server(self):
         """MCP 서버 시작"""
@@ -61,15 +65,22 @@ class MCPClient:
         # 환경 변수를 서브프로세스에 전달
         env = os.environ.copy()
         env["ROS_LOG_DIR"] = "/tmp"
+        ros_setup = "/opt/ros/humble/setup.bash"
+        unitree_setup = os.path.expanduser("~/unitree_ws/src/unitree_ros2/setup_local.sh")
+        server_cmd = (
+            f"source {ros_setup} >/dev/null && "
+            f"source {unitree_setup} >/dev/null && "
+            "python3 -m ros_mcp.server"
+        )
 
         self.server_process = subprocess.Popen(
-            ['python3', '-m', 'ros_mcp.server'],
+            ['bash', '-lc', server_cmd],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,  # stderr도 캡처하여 디버깅 가능
             text=True,
             bufsize=1,
-            cwd=project_root,  # src 디렉토리에서 실행
+            cwd=project_root,
             env=env  # 환경 변수 전달
         )
 

@@ -1,0 +1,12 @@
+Fri Mar  6 15:42:55 2026
+ERROR: could not initialize GLFW
+
+Mon Mar  9 17:39:42 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 4. The simulation is unstable. Time = 0.0380.
+
+Mon Mar  9 17:44:10 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 40. The simulation is unstable. Time = 0.0820.
+
+Tue Mar 10 15:31:08 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 7. The simulation is unstable. Time = 0.0460.
+

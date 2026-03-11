@@ -2,20 +2,41 @@
 ROS2 MCP Server
 
 MCP(Model Context Protocol)를 통해 G1 로봇을 제어하는 서버
-
-환경 변수:
-    ROBOT_NAMESPACE: 로봇 네임스페이스 (기본값: "")
 """
 
+import atexit
 import os
+
 from fastmcp import FastMCP
+from ros_mcp.server.g1_robot import G1Robot
 
-from .g1_robot import G1Robot
 
-
-# MCP 서버 초기화
 mcp = FastMCP("ros2-mcp-server")
 
-# G1 로봇 인스턴스 생성
 robot_namespace = os.getenv("ROBOT_NAMESPACE", "")
-robot = G1Robot(robot_namespace=robot_namespace)
+robot = None
+
+
+def get_robot() -> G1Robot:
+    global robot
+    if robot is None:
+        robot = G1Robot(robot_namespace=robot_namespace)
+    return robot
+
+
+def _shutdown_robot():
+    if robot is not None:
+        robot.shutdown()
+
+
+atexit.register(_shutdown_robot)
+
+
+def main():
+    from ros_mcp.server import tools  # noqa: F401
+
+    mcp.run(transport="stdio", show_banner=False)
+
+
+if __name__ == "__main__":
+    main()

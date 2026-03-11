@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 G1 Humanoid Robot Controller
 
@@ -9,6 +11,8 @@ G1 Humanoid Robot Controller
 """
 
 import json
+import struct
+import sys
 import time
 import threading
 import numpy as np
@@ -16,6 +20,8 @@ from typing import Optional, List, Dict, Any
 
 # ROS 2
 import rclpy
+from rclpy.context import Context
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import Twist
 
@@ -27,8 +33,8 @@ try:
     UNITREE_ROS2_AVAILABLE = True
 except ImportError:
     UNITREE_ROS2_AVAILABLE = False
-    print("[WARN] unitree messages not found.")
-    print("       Source: source ~/unitree_ws/src/unitree_ros2/setup_local.sh")
+    print("[WARN] unitree messages not found.", file=sys.stderr)
+    print("       Source: source ~/unitree_ws/src/unitree_ros2/setup_local.sh", file=sys.stderr)
 
 
 # ============================================================
@@ -65,6 +71,63 @@ TASK_ID_WAVE_HAND = 0
 TASK_ID_WAVE_HAND_WITH_TURN = 1
 TASK_ID_SHAKE_HAND_START = 2
 TASK_ID_SHAKE_HAND_END = 3
+
+
+class HGLowCmdCRC:
+    """unitree_hg.msg.LowCmd CRC 계산기"""
+
+    _PACK_FMT = "<2B2x" + "B3x5fI" * 35 + "5I"
+
+    def crc(self, cmd) -> int:
+        values = [cmd.mode_pr, cmd.mode_machine]
+
+        for i in range(35):
+            motor = cmd.motor_cmd[i]
+            values.append(motor.mode)
+            values.append(motor.q)
+            values.append(motor.dq)
+            values.append(motor.tau)
+            values.append(motor.kp)
+            values.append(motor.kd)
+            values.append(motor.reserve)
+
+        values.extend(cmd.reserve)
+        values.append(0)
+
+        packed = struct.pack(self._PACK_FMT, *values)
+        data = []
+        calc_len = (len(packed) >> 2) - 1
+        for i in range(calc_len):
+            base = i * 4
+            word = (
+                (packed[base + 3] << 24)
+                | (packed[base + 2] << 16)
+                | (packed[base + 1] << 8)
+                | packed[base]
+            )
+            data.append(word)
+
+        return self._crc32_core(data)
+
+    @staticmethod
+    def _crc32_core(data: List[int]) -> int:
+        crc = 0xFFFFFFFF
+        polynomial = 0x04C11DB7
+
+        for current in data:
+            bit = 1 << 31
+            for _ in range(32):
+                if crc & 0x80000000:
+                    crc = ((crc << 1) & 0xFFFFFFFF) ^ polynomial
+                else:
+                    crc = (crc << 1) & 0xFFFFFFFF
+
+                if current & bit:
+                    crc ^= polynomial
+
+                bit >>= 1
+
+        return crc
 
 
 class G1Robot:
@@ -117,7 +180,7 @@ class G1Robot:
         RIGHT_WRIST_PITCH = 27
         RIGHT_WRIST_YAW = 28
 
-    # 관절 이름
+    # 관절 이름(29)
     JOINT_NAMES = [
         "left_hip_pitch", "left_hip_roll", "left_hip_yaw",
         "left_knee", "left_ankle_pitch", "left_ankle_roll",
@@ -145,11 +208,15 @@ class G1Robot:
     def __init__(self, robot_namespace: str = ""):
         """G1 로봇 초기화"""
         self.namespace = robot_namespace
+        self.crc = HGLowCmdCRC()
+        self._mode_machine_logged = False
+        self._shutdown = False
+        self.context = Context()
+        self.executor: Optional[SingleThreadedExecutor] = None
+        self.executor_thread: Optional[threading.Thread] = None
 
-        if not rclpy.ok():
-            rclpy.init()
-
-        self.node = rclpy.create_node('g1_mcp_robot')
+        self.context.init()
+        self.node = rclpy.create_node('g1_mcp_robot', context=self.context)
         self.cmd_vel_topic = "/cmd_vel"
         self.cmd_vel_pub = self.node.create_publisher(
             Twist,
@@ -170,8 +237,9 @@ class G1Robot:
         # ROS2 초기화
         if UNITREE_ROS2_AVAILABLE:
             self._init_ros2_interfaces()
+            self._start_executor()
         else:
-            print("[G1Robot] WARNING: unitree messages not available!")
+            print("[G1Robot] WARNING: unitree messages not available!", file=sys.stderr)
 
     def _init_ros2_interfaces(self):
         """ROS2 인터페이스 초기화"""
@@ -223,9 +291,22 @@ class G1Robot:
             SportModeState, "/sportmodestate", self._sportmode_callback, qos_best_effort
         )
 
-        print("[G1Robot] ROS2 interfaces initialized")
-        print(f"  Publishers: /lowcmd, /api/sport/request, /arm_sdk")
-        print(f"  Subscribers: /lowstate, /api/sport/response, /sportmodestate")
+        print("[G1Robot] ROS2 interfaces initialized", file=sys.stderr)
+        print("  Publishers: /lowcmd, /api/sport/request, /arm_sdk", file=sys.stderr)
+        print("  Subscribers: /lowstate, /api/sport/response, /sportmodestate", file=sys.stderr)
+
+    def _start_executor(self):
+        """백그라운드에서 ROS callback을 지속적으로 처리"""
+        self.executor = SingleThreadedExecutor(context=self.context)
+        self.executor.add_node(self.node)
+
+        self.executor_thread = threading.Thread(
+            target=self.executor.spin,
+            name="g1_robot_executor",
+            daemon=True,
+        )
+        self.executor_thread.start()
+        print("[G1Robot] ROS executor thread started", file=sys.stderr)
 
     # ============================================================
     # 콜백 함수
@@ -234,6 +315,9 @@ class G1Robot:
     def _lowstate_callback(self, msg: LowState):
         """저수준 상태 콜백"""
         self.low_state = msg
+        if not self._mode_machine_logged and hasattr(msg, "mode_machine"):
+            print(f"[G1Robot] low_state.mode_machine = {int(msg.mode_machine)}", file=sys.stderr)
+            self._mode_machine_logged = True
 
     def _api_response_callback(self, msg: Response):
         """API 응답 콜백"""
@@ -292,6 +376,16 @@ class G1Robot:
 
         return cmd
 
+    def _publish_lowcmd(self, cmd: LowCmd) -> None:
+        """CRC를 채운 뒤 /lowcmd로 발행"""
+        cmd.crc = self.crc.crc(cmd)
+        self.lowcmd_pub.publish(cmd)
+
+    def _publish_arm_sdk(self, cmd: LowCmd) -> None:
+        """CRC를 채운 뒤 /arm_sdk로 발행"""
+        cmd.crc = self.crc.crc(cmd)
+        self.arm_sdk_pub.publish(cmd)
+
     def _get_kp_kd(self, joint_id: int) -> tuple:
         """관절별 기본 KP, KD 값 반환"""
         if joint_id < 12:  # 다리
@@ -307,6 +401,8 @@ class G1Robot:
 
     def _spin_once(self):
         """ROS 콜백 한 번 처리"""
+        if self.executor_thread and self.executor_thread.is_alive():
+            return
         rclpy.spin_once(self.node, timeout_sec=0.1)
 
     def get_joint_states(self) -> dict:
@@ -638,7 +734,7 @@ class G1Robot:
                 cmd.motor_cmd[joint_id].kp = kp
                 cmd.motor_cmd[joint_id].kd = kd
 
-        self.arm_sdk_pub.publish(cmd)
+        self._publish_arm_sdk(cmd)
         return {"success": True}
 
     def set_left_arm_position(self, positions: list, duration: float = 1.0) -> dict:
@@ -719,7 +815,7 @@ class G1Robot:
         cmd.motor_cmd[joint_id].kp = float(kp)
         cmd.motor_cmd[joint_id].kd = float(kd)
 
-        self.lowcmd_pub.publish(cmd)
+        self._publish_lowcmd(cmd)
 
         return {
             "success": True,
@@ -747,7 +843,7 @@ class G1Robot:
             cmd.motor_cmd[i].kp = float(kp)
             cmd.motor_cmd[i].kd = float(kd)
 
-        self.lowcmd_pub.publish(cmd)
+        self._publish_lowcmd(cmd)
 
         return {
             "success": True,
@@ -778,7 +874,7 @@ class G1Robot:
             cmd.motor_cmd[joint_id].kp = float(kp)
             cmd.motor_cmd[joint_id].kd = float(kd)
 
-        self.lowcmd_pub.publish(cmd)
+        self._publish_lowcmd(cmd)
 
         return {
             "success": True,
@@ -821,8 +917,34 @@ class G1Robot:
 
     def shutdown(self):
         """종료"""
+        if self._shutdown:
+            return
+        self._shutdown = True
+
         if self.is_standing:
-            self.damp()  # 안전하게 댐핑 모드로 전환
-        twist = Twist()
-        self.cmd_vel_pub.publish(twist)
-        self.node.destroy_node()
+            try:
+                self.damp()  # 안전하게 댐핑 모드로 전환
+            except Exception:
+                pass
+
+        if self.executor:
+            self.executor.shutdown()
+            if self.executor_thread and self.executor_thread.is_alive():
+                self.executor_thread.join(timeout=1.0)
+            self.executor = None
+            self.executor_thread = None
+
+        if getattr(self, "node", None) is None:
+            return
+
+        if self.context.ok() and getattr(self, "cmd_vel_pub", None) is not None:
+            try:
+                self.cmd_vel_pub.publish(Twist())
+            except Exception:
+                pass
+
+        try:
+            self.node.destroy_node()
+        finally:
+            self.node = None
+            self.context.try_shutdown()
