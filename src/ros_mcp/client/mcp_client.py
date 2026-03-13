@@ -1,6 +1,6 @@
-import asyncio
 import json
 import os
+from pathlib import Path
 import select
 import subprocess
 import sys
@@ -59,17 +59,35 @@ class MCPClient:
     def start_server(self):
         """MCP 서버 시작"""
         print("MCP 서버 시작 중...")
-        # 프로젝트 루트 디렉토리 계산 (client -> mcp -> src -> project_root)
-        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        # 프로젝트 루트 디렉토리 계산 (client -> ros_mcp -> src -> project_root)
+        project_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        )
+        ros_setup = Path("/opt/ros/humble/setup.bash")
+        local_setup = Path(project_root) / "ros2" / "unitree_ros2" / "setup_local.sh"
+
+        if not ros_setup.exists():
+            raise RuntimeError(f"ROS 2 setup script not found: {ros_setup}")
+
+        if not local_setup.exists():
+            raise RuntimeError(
+                f"Unitree local setup script not found: {local_setup}"
+            )
 
         # 환경 변수를 서브프로세스에 전달
         env = os.environ.copy()
         env["ROS_LOG_DIR"] = "/tmp"
-        ros_setup = "/opt/ros/humble/setup.bash"
-        unitree_setup = os.path.expanduser("~/unitree_ws/src/unitree_ros2/setup_local.sh")
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{project_root}/src:{existing_pythonpath}" if existing_pythonpath else f"{project_root}/src"
         server_cmd = (
             f"source {ros_setup} >/dev/null && "
-            f"source {unitree_setup} >/dev/null && "
+            f"source {local_setup} >/dev/null && "
+            "echo '[MCP SERVER ENV] which python3:' $(which python3) >&2 && "
+            "echo '[MCP SERVER ENV] PYTHONPATH:' \"$PYTHONPATH\" >&2 && "
+            "echo '[MCP SERVER ENV] RMW_IMPLEMENTATION:' \"$RMW_IMPLEMENTATION\" >&2 && "
+            "echo '[MCP SERVER ENV] ROS_DOMAIN_ID:' \"${ROS_DOMAIN_ID:-<unset>}\" >&2 && "
+            "echo '[MCP SERVER ENV] CYCLONEDDS_URI:' \"$CYCLONEDDS_URI\" >&2 && "
+            "python3 -c 'import rclpy; print(\"[MCP SERVER ENV] rclpy:\", rclpy.__file__)' >&2 && "
             "python3 -m ros_mcp.server"
         )
 
@@ -220,44 +238,48 @@ def agent_loop(client: MCPClient, user_input: str):
 
 
         if message.get("tool_calls"):
-            print(f"[LLM] Tool calls: {len(message['tool_calls'])}개")
-            for tool_call in message["tool_calls"]:
-                function_name = tool_call["function"]["name"]
-                raw_arguments = tool_call["function"]["arguments"]
+            tool_calls = message["tool_calls"]
+            print(f"[LLM] Tool calls: {len(tool_calls)}개")
+            if len(tool_calls) > 1:
+                print("[SYSTEM] 한 iteration당 tool call 1개만 허용되어 첫 번째만 실행합니다.")
 
-                # JSON 파싱 시도
-                try:
-                    # 빈 문자열이면 바로 빈 dict 사용
-                    if not raw_arguments or not raw_arguments.strip():
-                        arguments = {}
-                    else:
-                        arguments = json.loads(raw_arguments)
-                except json.JSONDecodeError:
-                    # 잘못된 JSON 패턴 감지 및 수정
-                    if raw_arguments.strip() in ['{""}', '{""}', '{" "}']:
-                        arguments = {}
-                    else:
-                        arguments = {}
+            tool_call = tool_calls[0]
+            function_name = tool_call["function"]["name"]
+            raw_arguments = tool_call["function"]["arguments"]
 
-                # 함수 시그니처 스타일로 출력
-                if arguments:
-                    args_str = ", ".join(f"{k}={v}" for k, v in arguments.items())
-                    print(f"[TOOL] {function_name}({args_str})")
+            # JSON 파싱 시도
+            try:
+                # 빈 문자열이면 바로 빈 dict 사용
+                if not raw_arguments or not raw_arguments.strip():
+                    arguments = {}
                 else:
-                    print(f"[TOOL] {function_name}()")
+                    arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                # 잘못된 JSON 패턴 감지 및 수정
+                if raw_arguments.strip() in ['{""}', '{""}', '{" "}']:
+                    arguments = {}
+                else:
+                    arguments = {}
 
-                # 실행 시간 측정
-                start_time = time.time()
-                result = client.call_tool(function_name, arguments)
-                elapsed_time = time.time() - start_time
+            # 함수 시그니처 스타일로 출력
+            if arguments:
+                args_str = ", ".join(f"{k}={v}" for k, v in arguments.items())
+                print(f"[TOOL] {function_name}({args_str})")
+            else:
+                print(f"[TOOL] {function_name}()")
 
-                print(f"[RESULT] {result} (실행시간: {elapsed_time:.2f}초)")
+            # 실행 시간 측정
+            start_time = time.time()
+            result = client.call_tool(function_name, arguments)
+            elapsed_time = time.time() - start_time
 
-                conversation_history.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": result
-                })
+            print(f"[RESULT] {result} (실행시간: {elapsed_time:.2f}초)")
+
+            conversation_history.append({
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": result
+            })
 
         else:
             # 최종 응답 출력

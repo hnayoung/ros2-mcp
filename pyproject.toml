@@ -6,5 +6,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp",
+    "mujoco",
     "numpy",
+    "python-dotenv",
+    "requests",
 ]

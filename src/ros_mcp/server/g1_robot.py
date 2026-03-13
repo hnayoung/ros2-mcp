@@ -3,74 +3,32 @@ from __future__ import annotations
 """
 G1 Humanoid Robot Controller
 
-실제 G1 로봇 제어
-- High-Level: /api/sport/request, /api/sport/response (FSM 기반)
-- Low-Level: /lowcmd, /lowstate (관절 직접 제어)
-- Arm: /arm_sdk (팔 전용 제어)
-- Status: /sportmodestate (로봇 상태)
+저수준 G1 제어 전용 구현
+- Low-Level: /lowcmd, /lowstate
 """
 
-import json
 import struct
 import sys
-import time
 import threading
-import numpy as np
-from typing import Optional, List, Dict, Any
+import time
+from typing import Optional, List
 
 # ROS 2
 import rclpy
-from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from geometry_msgs.msg import Twist
 
 # Unitree ROS2 메시지 타입
 try:
-    from unitree_hg.msg import LowCmd, LowState
-    from unitree_go.msg import SportModeState, WirelessController
-    from unitree_api.msg import Request, Response
+    from unitree_hg.msg import HandCmd, HandState, LowCmd, LowState, MotorCmd
     UNITREE_ROS2_AVAILABLE = True
 except ImportError:
     UNITREE_ROS2_AVAILABLE = False
     print("[WARN] unitree messages not found.", file=sys.stderr)
-    print("       Source: source ~/unitree_ws/src/unitree_ros2/setup_local.sh", file=sys.stderr)
-
-
-# ============================================================
-# G1 API ID 상수 (g1_loco_client.hpp 참조)
-# ============================================================
-
-# Get API IDs
-ROBOT_API_ID_LOCO_GET_FSM_ID = 7001
-ROBOT_API_ID_LOCO_GET_FSM_MODE = 7002
-ROBOT_API_ID_LOCO_GET_BALANCE_MODE = 7003
-ROBOT_API_ID_LOCO_GET_SWING_HEIGHT = 7004
-ROBOT_API_ID_LOCO_GET_STAND_HEIGHT = 7005
-ROBOT_API_ID_LOCO_GET_PHASE = 7006
-
-# Set API IDs
-ROBOT_API_ID_LOCO_SET_FSM_ID = 7101
-ROBOT_API_ID_LOCO_SET_BALANCE_MODE = 7102
-ROBOT_API_ID_LOCO_SET_SWING_HEIGHT = 7103
-ROBOT_API_ID_LOCO_SET_STAND_HEIGHT = 7104
-ROBOT_API_ID_LOCO_SET_VELOCITY = 7105
-ROBOT_API_ID_LOCO_SET_ARM_TASK = 7106
-ROBOT_API_ID_LOCO_SET_SPEED_MODE = 7107
-
-# FSM IDs
-FSM_ID_ZERO_TORQUE = 0
-FSM_ID_DAMP = 1
-FSM_ID_SQUAT = 2
-FSM_ID_SIT = 3
-FSM_ID_STAND_UP = 4
-FSM_ID_START = 500
-
-# Task IDs (for arm gestures)
-TASK_ID_WAVE_HAND = 0
-TASK_ID_WAVE_HAND_WITH_TURN = 1
-TASK_ID_SHAKE_HAND_START = 2
-TASK_ID_SHAKE_HAND_END = 3
+    print(
+        "       Source: source /home/na0/workspace/ros2-mcp/ros2/unitree_ros2/setup_local.sh",
+        file=sys.stderr,
+    )
 
 
 class HGLowCmdCRC:
@@ -132,16 +90,20 @@ class HGLowCmdCRC:
 
 class G1Robot:
     """
-    Unitree G1 휴머노이드 로봇 제어
+    Unitree G1 휴머노이드 로봇 저수준 제어
 
     토픽:
     - /lowcmd: 저수준 모터 명령 (Publish)
     - /lowstate: 저수준 모터 상태 (Subscribe)
-    - /arm_sdk: 팔 제어 명령 (Publish)
     """
 
-    ROBOT_NAME = 'g1'
     NUM_MOTORS = 29
+    NUM_HAND_MOTORS = 6
+    DEFAULT_BODY_POSE = [0.0] * NUM_MOTORS
+    LEFT_HAND_CMD_TOPIC = "/inspire/left/cmd"
+    RIGHT_HAND_CMD_TOPIC = "/inspire/right/cmd"
+    LEFT_HAND_STATE_TOPIC = "/lf/inspire/left/state"
+    RIGHT_HAND_STATE_TOPIC = "/lf/inspire/right/state"
 
     # 관절 인덱스
     class JointIndex:
@@ -192,6 +154,22 @@ class G1Robot:
         "right_shoulder_pitch", "right_shoulder_roll", "right_shoulder_yaw",
         "right_elbow", "right_wrist_roll", "right_wrist_pitch", "right_wrist_yaw"
     ]
+    LEFT_HAND_JOINT_NAMES = [
+        "L_thumb_proximal_yaw_joint",
+        "L_thumb_proximal_pitch_joint",
+        "L_index_proximal_joint",
+        "L_middle_proximal_joint",
+        "L_ring_proximal_joint",
+        "L_pinky_proximal_joint",
+    ]
+    RIGHT_HAND_JOINT_NAMES = [
+        "R_thumb_proximal_yaw_joint",
+        "R_thumb_proximal_pitch_joint",
+        "R_index_proximal_joint",
+        "R_middle_proximal_joint",
+        "R_ring_proximal_joint",
+        "R_pinky_proximal_joint",
+    ]
 
     # 기본 PD 게인
     DEFAULT_KP = {
@@ -211,28 +189,15 @@ class G1Robot:
         self.crc = HGLowCmdCRC()
         self._mode_machine_logged = False
         self._shutdown = False
-        self.context = Context()
         self.executor: Optional[SingleThreadedExecutor] = None
         self.executor_thread: Optional[threading.Thread] = None
 
-        self.context.init()
-        self.node = rclpy.create_node('g1_mcp_robot', context=self.context)
-        self.cmd_vel_topic = "/cmd_vel"
-        self.cmd_vel_pub = self.node.create_publisher(
-            Twist,
-            self.cmd_vel_topic,
-            QoSProfile(depth=10)
-        )
+        self.node = self._create_ros_node()
 
         # 상태 변수
         self.low_state: Optional[LowState] = None
-        self.sport_mode_state: Optional[SportModeState] = None
-        self.api_response: Optional[Response] = None
-        self.response_received = threading.Event()
-
-        self.is_standing = False
-        self.continuous_gait_enabled = False
-        self.current_fsm_id = -1
+        self.left_hand_state: Optional[HandState] = None
+        self.right_hand_state: Optional[HandState] = None
 
         # ROS2 초기화
         if UNITREE_ROS2_AVAILABLE:
@@ -241,16 +206,30 @@ class G1Robot:
         else:
             print("[G1Robot] WARNING: unitree messages not available!", file=sys.stderr)
 
+    def _create_ros_node(self):
+        """stale RMW 상태를 정리하며 ROS2 node 생성"""
+        last_error = None
+        for attempt in range(2):
+            try:
+                if not rclpy.ok():
+                    rclpy.init()
+                return rclpy.create_node("g1_mcp_robot")
+            except Exception as exc:
+                last_error = exc
+                print(
+                    f"[G1Robot] ROS node creation failed (attempt {attempt + 1}/2): {exc}",
+                    file=sys.stderr,
+                )
+                try:
+                    rclpy.try_shutdown()
+                except Exception:
+                    pass
+                time.sleep(0.1)
+
+        raise RuntimeError(f"failed to initialize ROS2 node: {last_error}") from last_error
+
     def _init_ros2_interfaces(self):
         """ROS2 인터페이스 초기화"""
-
-        # QoS 설정
-        qos_reliable = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
-        )
 
         qos_best_effort = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -264,15 +243,11 @@ class G1Robot:
         self.lowcmd_pub = self.node.create_publisher(
             LowCmd, "/lowcmd", qos_best_effort
         )
-
-        # 고수준 API 요청
-        self.api_request_pub = self.node.create_publisher(
-            Request, "/api/sport/request", qos_reliable
+        self.left_hand_cmd_pub = self.node.create_publisher(
+            HandCmd, self.LEFT_HAND_CMD_TOPIC, qos_best_effort
         )
-
-        # 팔 제어 (arm_sdk)
-        self.arm_sdk_pub = self.node.create_publisher(
-            LowCmd, "/arm_sdk", qos_reliable
+        self.right_hand_cmd_pub = self.node.create_publisher(
+            HandCmd, self.RIGHT_HAND_CMD_TOPIC, qos_best_effort
         )
 
         # ===== Subscribers =====
@@ -280,24 +255,26 @@ class G1Robot:
         self.lowstate_sub = self.node.create_subscription(
             LowState, "/lowstate", self._lowstate_callback, qos_best_effort
         )
-
-        # 고수준 API 응답
-        self.api_response_sub = self.node.create_subscription(
-            Response, "/api/sport/response", self._api_response_callback, qos_reliable
+        self.left_hand_state_sub = self.node.create_subscription(
+            HandState, self.LEFT_HAND_STATE_TOPIC, self._left_hand_state_callback, qos_best_effort
         )
-
-        # 스포츠 모드 상태
-        self.sportmode_sub = self.node.create_subscription(
-            SportModeState, "/sportmodestate", self._sportmode_callback, qos_best_effort
+        self.right_hand_state_sub = self.node.create_subscription(
+            HandState, self.RIGHT_HAND_STATE_TOPIC, self._right_hand_state_callback, qos_best_effort
         )
 
         print("[G1Robot] ROS2 interfaces initialized", file=sys.stderr)
-        print("  Publishers: /lowcmd, /api/sport/request, /arm_sdk", file=sys.stderr)
-        print("  Subscribers: /lowstate, /api/sport/response, /sportmodestate", file=sys.stderr)
+        print(
+            f"  Publishers: /lowcmd, {self.LEFT_HAND_CMD_TOPIC}, {self.RIGHT_HAND_CMD_TOPIC}",
+            file=sys.stderr,
+        )
+        print(
+            f"  Subscribers: /lowstate, {self.LEFT_HAND_STATE_TOPIC}, {self.RIGHT_HAND_STATE_TOPIC}",
+            file=sys.stderr,
+        )
 
     def _start_executor(self):
         """백그라운드에서 ROS callback을 지속적으로 처리"""
-        self.executor = SingleThreadedExecutor(context=self.context)
+        self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
 
         self.executor_thread = threading.Thread(
@@ -319,45 +296,15 @@ class G1Robot:
             print(f"[G1Robot] low_state.mode_machine = {int(msg.mode_machine)}", file=sys.stderr)
             self._mode_machine_logged = True
 
-    def _api_response_callback(self, msg: Response):
-        """API 응답 콜백"""
-        self.api_response = msg
-        self.response_received.set()
+    def _left_hand_state_callback(self, msg: HandState):
+        self.left_hand_state = msg
 
-    def _sportmode_callback(self, msg: SportModeState):
-        """스포츠 모드 상태 콜백"""
-        self.sport_mode_state = msg
+    def _right_hand_state_callback(self, msg: HandState):
+        self.right_hand_state = msg
 
     # ============================================================
     # 헬퍼 함수
     # ============================================================
-
-    def _send_api_request(self, api_id: int, parameter: dict = None, wait_response: bool = True, timeout: float = 2.0) -> dict:
-        """API 요청 전송"""
-        if not UNITREE_ROS2_AVAILABLE:
-            return {"error": "unitree_ros2 not available"}
-
-        req = Request()
-        req.header.identity.api_id = api_id
-
-        if parameter:
-            req.parameter = json.dumps(parameter)
-        else:
-            req.parameter = ""
-
-        self.response_received.clear()
-        self.api_request_pub.publish(req)
-
-        if wait_response:
-            if self.response_received.wait(timeout):
-                if self.api_response:
-                    return {
-                        "success": True,
-                        "data": self.api_response.data if hasattr(self.api_response, 'data') else None
-                    }
-            return {"error": "Response timeout"}
-
-        return {"success": True, "message": "Request sent (no response wait)"}
 
     def _create_low_cmd(self) -> LowCmd:
         """LowCmd 메시지 생성"""
@@ -381,10 +328,9 @@ class G1Robot:
         cmd.crc = self.crc.crc(cmd)
         self.lowcmd_pub.publish(cmd)
 
-    def _publish_arm_sdk(self, cmd: LowCmd) -> None:
-        """CRC를 채운 뒤 /arm_sdk로 발행"""
-        cmd.crc = self.crc.crc(cmd)
-        self.arm_sdk_pub.publish(cmd)
+    @staticmethod
+    def _publish_handcmd(publisher, cmd: HandCmd) -> None:
+        publisher.publish(cmd)
 
     def _get_kp_kd(self, joint_id: int) -> tuple:
         """관절별 기본 KP, KD 값 반환"""
@@ -445,384 +391,89 @@ class G1Robot:
 
         return {"error": "LowState not received"}
 
-    def get_robot_position(self) -> dict:
-        """로봇 위치/속도 조회"""
+    def get_hand_states(self) -> dict:
+        """손 상태 조회"""
         self._spin_once()
 
-        if self.sport_mode_state:
+        def _extract(state: Optional[HandState], joint_names: List[str]) -> dict:
+            if state is None:
+                return {"received": False}
+            positions = [round(float(m.q), 4) for m in state.motor_state[: len(joint_names)]]
+            velocities = [round(float(m.dq), 4) for m in state.motor_state[: len(joint_names)]]
+            efforts = [round(float(m.tau_est), 4) for m in state.motor_state[: len(joint_names)]]
             return {
-                "success": True,
-                "position": list(self.sport_mode_state.position),
-                "velocity": list(self.sport_mode_state.velocity),
-                "yaw_speed": float(self.sport_mode_state.yaw_speed),
-                "body_height": float(self.sport_mode_state.body_height)
+                "received": True,
+                "joint_names": joint_names,
+                "positions": positions,
+                "velocities": velocities,
+                "efforts": efforts,
             }
-
-        return {"error": "SportModeState not received", "hint": "Check /sportmodestate topic"}
-
-    def get_sport_mode(self) -> dict:
-        """스포츠 모드 상태 조회"""
-        self._spin_once()
-
-        if self.sport_mode_state:
-            return {
-                "success": True,
-                "mode": int(self.sport_mode_state.mode),
-                "gait_type": int(self.sport_mode_state.gait_type),
-                "progress": float(self.sport_mode_state.progress),
-                "foot_raise_height": float(self.sport_mode_state.foot_raise_height),
-                "foot_force": list(self.sport_mode_state.foot_force)
-            }
-
-        return {"error": "SportModeState not received"}
-
-    def get_fsm_id(self) -> dict:
-        """FSM 상태 ID 조회"""
-        result = self._send_api_request(ROBOT_API_ID_LOCO_GET_FSM_ID)
-
-        if result.get("success"):
-            try:
-                data = json.loads(result.get("data", "{}"))
-                self.current_fsm_id = data.get("data", -1)
-                return {
-                    "success": True,
-                    "fsm_id": self.current_fsm_id,
-                    "fsm_name": self._get_fsm_name(self.current_fsm_id)
-                }
-            except:
-                pass
-
-        return result
-
-    def _get_fsm_name(self, fsm_id: int) -> str:
-        """FSM ID를 이름으로 변환"""
-        names = {
-            0: "ZeroTorque",
-            1: "Damp",
-            2: "Squat",
-            3: "Sit",
-            4: "StandUp",
-            500: "Start"
-        }
-        return names.get(fsm_id, f"Unknown({fsm_id})")
-
-    def get_battery_state(self) -> dict:
-        """배터리 상태 조회"""
-        self._spin_once()
-
-        # BMS 상태는 LowState에 포함될 수 있음 (로봇 모델에 따라 다름)
-        if self.low_state:
-            return {
-                "success": True,
-                "note": "Battery info may vary by robot model",
-                "mode_machine": int(self.low_state.mode_machine)
-            }
-
-        return {"error": "LowState not received"}
-
-    def get_robot_status(self) -> dict:
-        """로봇 전체 상태 요약"""
-        self._spin_once()
-
-        status = {
-            "success": True,
-            "robot_name": self.ROBOT_NAME,
-            "ros2_available": UNITREE_ROS2_AVAILABLE,
-            "is_standing": self.is_standing,
-            "continuous_gait": self.continuous_gait_enabled,
-            "lowstate_received": self.low_state is not None,
-            "sportmode_received": self.sport_mode_state is not None
-        }
-
-        if self.sport_mode_state:
-            status["position"] = list(self.sport_mode_state.position)
-            status["mode"] = int(self.sport_mode_state.mode)
-
-        return status
-
-    # ============================================================
-    # 2. 고수준 동작 (High-Level via /api/sport/request)
-    # ============================================================
-
-    def _set_fsm_id(self, fsm_id: int) -> dict:
-        """FSM ID 설정 (내부 함수)"""
-        result = self._send_api_request(
-            ROBOT_API_ID_LOCO_SET_FSM_ID,
-            {"data": fsm_id},
-            wait_response=True
-        )
-
-        if result.get("success"):
-            self.current_fsm_id = fsm_id
-
-        return result
-
-    def stand_up(self) -> dict:
-        """일어서기 (FSM 4)"""
-        result = self._set_fsm_id(FSM_ID_STAND_UP)
-        if result.get("success"):
-            self.is_standing = True
-            return {"success": True, "action": "stand_up", "fsm_id": FSM_ID_STAND_UP}
-        return result
-
-    def sit_down(self) -> dict:
-        """앉기 (FSM 3)"""
-        result = self._set_fsm_id(FSM_ID_SIT)
-        if result.get("success"):
-            self.is_standing = False
-            return {"success": True, "action": "sit_down", "fsm_id": FSM_ID_SIT}
-        return result
-
-    def squat(self) -> dict:
-        """쪼그려 앉기 (FSM 2)"""
-        result = self._set_fsm_id(FSM_ID_SQUAT)
-        if result.get("success"):
-            return {"success": True, "action": "squat", "fsm_id": FSM_ID_SQUAT}
-        return result
-
-    def damp(self) -> dict:
-        """댐핑 모드 - 긴급 정지 (FSM 1)"""
-        result = self._set_fsm_id(FSM_ID_DAMP)
-        if result.get("success"):
-            self.is_standing = False
-            return {"success": True, "action": "damp", "fsm_id": FSM_ID_DAMP}
-        return result
-
-    def zero_torque(self) -> dict:
-        """토크 제로 모드 (FSM 0)"""
-        result = self._set_fsm_id(FSM_ID_ZERO_TORQUE)
-        if result.get("success"):
-            self.is_standing = False
-            return {"success": True, "action": "zero_torque", "fsm_id": FSM_ID_ZERO_TORQUE}
-        return result
-
-    def start(self) -> dict:
-        """시작 모드 (FSM 500)"""
-        result = self._set_fsm_id(FSM_ID_START)
-        if result.get("success"):
-            return {"success": True, "action": "start", "fsm_id": FSM_ID_START}
-        return result
-
-    def move(self, vx: float = 0.0, vy: float = 0.0, vyaw: float = 0.0, duration: float = 1.0) -> dict:
-        """이동 명령 (SetVelocity)"""
-        result = self._send_api_request(
-            ROBOT_API_ID_LOCO_SET_VELOCITY,
-            {
-                "velocity": [vx, vy, vyaw],
-                "duration": duration
-            },
-            wait_response=False  # 이동 명령은 응답 대기 안 함
-        )
 
         return {
             "success": True,
-            "action": "move",
-            "vx": vx,
-            "vy": vy,
-            "vyaw": vyaw,
-            "duration": duration
+            "left_hand": _extract(self.left_hand_state, self.LEFT_HAND_JOINT_NAMES),
+            "right_hand": _extract(self.right_hand_state, self.RIGHT_HAND_JOINT_NAMES),
         }
 
-    def stop_move(self) -> dict:
-        """이동 정지"""
-        return self.move(0.0, 0.0, 0.0, 0.0)
-
-    def set_stand_height(self, height: float) -> dict:
-        """서있는 높이 설정"""
-        result = self._send_api_request(
-            ROBOT_API_ID_LOCO_SET_STAND_HEIGHT,
-            {"data": height}
-        )
-
-        if result.get("success"):
-            return {"success": True, "action": "set_stand_height", "height": height}
-        return result
-
-    def set_swing_height(self, height: float) -> dict:
-        """발 스윙 높이 설정"""
-        result = self._send_api_request(
-            ROBOT_API_ID_LOCO_SET_SWING_HEIGHT,
-            {"data": height}
-        )
-
-        if result.get("success"):
-            return {"success": True, "action": "set_swing_height", "height": height}
-        return result
-
-    def set_speed_mode(self, mode: int) -> dict:
-        """속도 모드 설정"""
-        result = self._send_api_request(
-            ROBOT_API_ID_LOCO_SET_SPEED_MODE,
-            {"data": mode}
-        )
-
-        if result.get("success"):
-            return {"success": True, "action": "set_speed_mode", "mode": mode}
-        return result
-
-    def set_balance_mode(self, mode: int) -> dict:
-        """균형 모드 설정"""
-        result = self._send_api_request(
-            ROBOT_API_ID_LOCO_SET_BALANCE_MODE,
-            {"data": mode}
-        )
-
-        if result.get("success"):
-            return {"success": True, "action": "set_balance_mode", "mode": mode}
-        return result
-
-    def enable_continuous_gait(self, enable: bool) -> dict:
-        """연속 걸음 모드 활성화/비활성화"""
-        mode = 1 if enable else 0
-        result = self.set_balance_mode(mode)
-
-        if result.get("success"):
-            self.continuous_gait_enabled = enable
-            return {"success": True, "action": "enable_continuous_gait", "enabled": enable}
-        return result
-
     # ============================================================
-    # 3. 제스처/퍼포먼스 (High-Level)
-    # ============================================================
-
-    def _set_task_id(self, task_id: int) -> dict:
-        """Task ID 설정 (제스처용)"""
-        return self._send_api_request(
-            ROBOT_API_ID_LOCO_SET_ARM_TASK,
-            {"data": task_id},
-            wait_response=False
-        )
-
-    def wave_hand(self) -> dict:
-        """손 흔들기"""
-        result = self._set_task_id(TASK_ID_WAVE_HAND)
-        return {"success": True, "action": "wave_hand", "task_id": TASK_ID_WAVE_HAND}
-
-    def wave_hand_with_turn(self) -> dict:
-        """돌면서 손 흔들기"""
-        result = self._set_task_id(TASK_ID_WAVE_HAND_WITH_TURN)
-        return {"success": True, "action": "wave_hand_with_turn", "task_id": TASK_ID_WAVE_HAND_WITH_TURN}
-
-    def shake_hand_start(self) -> dict:
-        """악수 시작"""
-        result = self._set_task_id(TASK_ID_SHAKE_HAND_START)
-        return {"success": True, "action": "shake_hand_start", "task_id": TASK_ID_SHAKE_HAND_START}
-
-    def shake_hand_end(self) -> dict:
-        """악수 종료"""
-        result = self._set_task_id(TASK_ID_SHAKE_HAND_END)
-        return {"success": True, "action": "shake_hand_end", "task_id": TASK_ID_SHAKE_HAND_END}
-
-    # ============================================================
-    # 4. 팔 제어 (via /arm_sdk)
-    # ============================================================
-
-    def _send_arm_cmd(self, joint_positions: dict, duration: float = 1.0) -> dict:
-        """팔 명령 전송 (/arm_sdk)"""
-        if not UNITREE_ROS2_AVAILABLE:
-            return {"error": "unitree_ros2 not available"}
-
-        cmd = self._create_low_cmd()
-
-        for joint_id, position in joint_positions.items():
-            if 0 <= joint_id < 35:
-                kp, kd = self._get_kp_kd(joint_id)
-                cmd.motor_cmd[joint_id].mode = 1
-                cmd.motor_cmd[joint_id].q = float(position)
-                cmd.motor_cmd[joint_id].dq = 0.0
-                cmd.motor_cmd[joint_id].tau = 0.0
-                cmd.motor_cmd[joint_id].kp = kp
-                cmd.motor_cmd[joint_id].kd = kd
-
-        self._publish_arm_sdk(cmd)
-        return {"success": True}
-
-    def set_left_arm_position(self, positions: list, duration: float = 1.0) -> dict:
-        """왼팔 위치 제어"""
-        if len(positions) != 7:
-            return {"error": f"Expected 7 positions, got {len(positions)}"}
-
-        joint_positions = {}
-        for i, pos in enumerate(positions):
-            joint_positions[self.JointIndex.LEFT_SHOULDER_PITCH + i] = pos
-
-        result = self._send_arm_cmd(joint_positions, duration)
-        if result.get("success"):
-            return {"success": True, "action": "set_left_arm_position", "positions": positions}
-        return result
-
-    def set_right_arm_position(self, positions: list, duration: float = 1.0) -> dict:
-        """오른팔 위치 제어"""
-        if len(positions) != 7:
-            return {"error": f"Expected 7 positions, got {len(positions)}"}
-
-        joint_positions = {}
-        for i, pos in enumerate(positions):
-            joint_positions[self.JointIndex.RIGHT_SHOULDER_PITCH + i] = pos
-
-        result = self._send_arm_cmd(joint_positions, duration)
-        if result.get("success"):
-            return {"success": True, "action": "set_right_arm_position", "positions": positions}
-        return result
-
-    def set_both_arms_position(self, left_positions: list, right_positions: list, duration: float = 1.0) -> dict:
-        """양팔 동시 위치 제어"""
-        if len(left_positions) != 7 or len(right_positions) != 7:
-            return {"error": "Expected 7 positions for each arm"}
-
-        joint_positions = {}
-        for i, pos in enumerate(left_positions):
-            joint_positions[self.JointIndex.LEFT_SHOULDER_PITCH + i] = pos
-        for i, pos in enumerate(right_positions):
-            joint_positions[self.JointIndex.RIGHT_SHOULDER_PITCH + i] = pos
-
-        result = self._send_arm_cmd(joint_positions, duration)
-        if result.get("success"):
-            return {"success": True, "action": "set_both_arms_position"}
-        return result
-
-    def set_waist_position(self, yaw: float = 0.0, roll: float = 0.0, pitch: float = 0.0, duration: float = 1.0) -> dict:
-        """허리 위치 제어"""
-        joint_positions = {
-            self.JointIndex.WAIST_YAW: yaw,
-            self.JointIndex.WAIST_ROLL: roll,
-            self.JointIndex.WAIST_PITCH: pitch
-        }
-
-        result = self._send_arm_cmd(joint_positions, duration)
-        if result.get("success"):
-            return {"success": True, "action": "set_waist_position", "yaw": yaw, "roll": roll, "pitch": pitch}
-        return result
-
-    # ============================================================
-    # 5. 저수준 관절 제어 (via /lowcmd)
+    # 2. 저수준 관절 제어 (via /lowcmd)
     # ============================================================
 
     def send_joint_command(self, joint_id: int, q: float = 0.0, dq: float = 0.0,
-                           tau: float = 0.0, kp: float = 50.0, kd: float = 1.0) -> dict:
-        """단일 관절 명령 전송"""
+                           tau: float = 0.0, kp: float = 50.0, kd: float = 1.0,
+                           duration: float = 0.3) -> dict:
+        """단일 관절 목표를 반영하되, 나머지 관절은 기본 자세를 유지하며 전신 포즈로 전송"""
         if not UNITREE_ROS2_AVAILABLE:
             return {"error": "unitree_ros2 not available"}
 
         if joint_id < 0 or joint_id >= self.NUM_MOTORS:
             return {"error": f"Invalid joint_id: {joint_id}. Must be 0-{self.NUM_MOTORS-1}"}
 
-        cmd = self._create_low_cmd()
-        cmd.motor_cmd[joint_id].mode = 1
-        cmd.motor_cmd[joint_id].q = float(q)
-        cmd.motor_cmd[joint_id].dq = float(dq)
-        cmd.motor_cmd[joint_id].tau = float(tau)
-        cmd.motor_cmd[joint_id].kp = float(kp)
-        cmd.motor_cmd[joint_id].kd = float(kd)
+        self._spin_once()
+        start_positions = self.DEFAULT_BODY_POSE.copy()
+        if self.low_state is not None:
+            start_positions = [float(self.low_state.motor_state[i].q) for i in range(self.NUM_MOTORS)]
 
-        self._publish_lowcmd(cmd)
+        target_positions = self.DEFAULT_BODY_POSE.copy()
+        target_positions[joint_id] = float(q)
+
+        if duration < 0:
+            return {"error": "duration must be >= 0"}
+
+        if duration == 0:
+            position_result = self.send_joint_positions(target_positions, kp=kp, kd=kd)
+            if not position_result.get("success"):
+                return position_result
+            steps = 1
+        else:
+            step_dt = 0.02
+            steps = max(1, int(duration / step_dt))
+            for step_idx in range(1, steps + 1):
+                alpha = step_idx / steps
+                blended_positions = [
+                    start_positions[i] + (target_positions[i] - start_positions[i]) * alpha
+                    for i in range(self.NUM_MOTORS)
+                ]
+                position_result = self.send_joint_positions(blended_positions, kp=kp, kd=kd)
+                if not position_result.get("success"):
+                    return position_result
+                if step_idx < steps:
+                    time.sleep(duration / steps)
 
         return {
             "success": True,
             "action": "send_joint_command",
+            "mode": "default_pose_hold_with_blend",
             "joint_id": joint_id,
             "joint_name": self.JOINT_NAMES[joint_id] if joint_id < len(self.JOINT_NAMES) else "unknown",
-            "q": q, "dq": dq, "tau": tau, "kp": kp, "kd": kd
+            "q": q,
+            "dq": dq,
+            "tau": tau,
+            "kp": kp,
+            "kd": kd,
+            "duration": duration,
+            "blend_steps": steps,
+            "hold_others": "default_pose",
         }
 
     def send_joint_positions(self, positions: list, kp: float = 50.0, kd: float = 1.0, duration: float = 1.0) -> dict:
@@ -851,40 +502,45 @@ class G1Robot:
             "num_joints": self.NUM_MOTORS
         }
 
-    def send_leg_command(self, leg: str, positions: list, kp: float = 100.0, kd: float = 2.0) -> dict:
-        """다리 관절 명령 전송"""
-        if len(positions) != 6:
-            return {"error": f"Expected 6 positions, got {len(positions)}"}
+    def send_hand_command(self, hand: str, positions: list, kp: float = 1.5, kd: float = 0.1) -> dict:
+        """단일 손 명령 전송"""
+        if len(positions) != self.NUM_HAND_MOTORS:
+            return {
+                "error": f"Expected {self.NUM_HAND_MOTORS} positions, got {len(positions)}"
+            }
 
-        if leg not in ["left", "right"]:
-            return {"error": f"Invalid leg: {leg}. Must be 'left' or 'right'"}
+        if hand not in ["left", "right"]:
+            return {"error": "hand must be 'left' or 'right'"}
 
         if not UNITREE_ROS2_AVAILABLE:
             return {"error": "unitree_ros2 not available"}
 
-        cmd = self._create_low_cmd()
+        cmd = HandCmd()
+        cmd.motor_cmd = []
+        for index, position in enumerate(positions):
+            motor_cmd = MotorCmd()
+            motor_cmd.mode = index
+            motor_cmd.q = float(position)
+            motor_cmd.dq = 0.0
+            motor_cmd.tau = 0.0
+            motor_cmd.kp = float(kp)
+            motor_cmd.kd = float(kd)
+            motor_cmd.reserve = 0
+            cmd.motor_cmd.append(motor_cmd)
 
-        start_idx = 0 if leg == "left" else 6
-        for i, pos in enumerate(positions):
-            joint_id = start_idx + i
-            cmd.motor_cmd[joint_id].mode = 1
-            cmd.motor_cmd[joint_id].q = float(pos)
-            cmd.motor_cmd[joint_id].dq = 0.0
-            cmd.motor_cmd[joint_id].tau = 0.0
-            cmd.motor_cmd[joint_id].kp = float(kp)
-            cmd.motor_cmd[joint_id].kd = float(kd)
-
-        self._publish_lowcmd(cmd)
+        publisher = self.left_hand_cmd_pub if hand == "left" else self.right_hand_cmd_pub
+        self._publish_handcmd(publisher, cmd)
 
         return {
             "success": True,
-            "action": "send_leg_command",
-            "leg": leg,
-            "positions": positions
+            "action": "send_hand_command",
+            "hand": hand,
+            "positions": positions,
+            "joint_names": self.LEFT_HAND_JOINT_NAMES if hand == "left" else self.RIGHT_HAND_JOINT_NAMES,
         }
 
     # ============================================================
-    # 6. 유틸리티
+    # 3. 유틸리티
     # ============================================================
 
     def get_joint_info(self) -> dict:
@@ -902,30 +558,32 @@ class G1Robot:
             "success": True,
             "num_joints": self.NUM_MOTORS,
             "joints": joints,
+            "hand_joints": {
+                "left_hand": {
+                    name: {"id": i}
+                    for i, name in enumerate(self.LEFT_HAND_JOINT_NAMES)
+                },
+                "right_hand": {
+                    name: {"id": i}
+                    for i, name in enumerate(self.RIGHT_HAND_JOINT_NAMES)
+                },
+            },
             "groups": {
                 "left_leg": list(range(0, 6)),
                 "right_leg": list(range(6, 12)),
                 "waist": list(range(12, 15)),
                 "left_arm": list(range(15, 22)),
-                "right_arm": list(range(22, 29))
+                "right_arm": list(range(22, 29)),
+                "left_hand": list(range(0, self.NUM_HAND_MOTORS)),
+                "right_hand": list(range(0, self.NUM_HAND_MOTORS)),
             }
         }
-
-    def get_pose(self) -> dict:
-        """현재 위치 조회"""
-        return self.get_robot_position()
 
     def shutdown(self):
         """종료"""
         if self._shutdown:
             return
         self._shutdown = True
-
-        if self.is_standing:
-            try:
-                self.damp()  # 안전하게 댐핑 모드로 전환
-            except Exception:
-                pass
 
         if self.executor:
             self.executor.shutdown()
@@ -937,14 +595,9 @@ class G1Robot:
         if getattr(self, "node", None) is None:
             return
 
-        if self.context.ok() and getattr(self, "cmd_vel_pub", None) is not None:
-            try:
-                self.cmd_vel_pub.publish(Twist())
-            except Exception:
-                pass
-
         try:
             self.node.destroy_node()
         finally:
             self.node = None
-            self.context.try_shutdown()
+            if rclpy.ok():
+                rclpy.shutdown()
